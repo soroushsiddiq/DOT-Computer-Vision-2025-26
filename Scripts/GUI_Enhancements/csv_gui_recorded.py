@@ -1,7 +1,7 @@
 """
-csv_gui.py
-----------
-CSV-first pose visualization GUI for the DOT Capstone CV pipeline.
+csv_recorded_gui.py
+-------------------
+Recorded CSV pose visualization GUI for the DOT Capstone CV pipeline.
 
 MANDATORY INPUT:
 - CSV file (Jan12GNCTest.csv style)
@@ -12,124 +12,103 @@ OPTIONAL INPUT:
 Key features:
 - Frame-by-frame playback (Play/Pause) using a Qt timer
 - Scrubber slider to jump to any frame
-- Pose panels for Pose1, Pose2, True
-- Real-time plots for Tx, Ty, Rz (main), and optional extra plots (Tz/Rx/Ry) via dropdown
+- Pose panels for Pose1, Pose2, True (shows Tx, Ty, Tz, Rx, Ry, Rz columns as-is)
+- MAIN plots (3 only): Rz (depth mm), Rx (lateral mm), Yaw_abs = atan2(Tx, Tz)+180 degrees
 - Vertical cursor line on each plot marking the current frame
-- "LAR: Looking LEFT/RIGHT/Straight" derived from True_Tx sign (with deadband)
+- "LAR: Looking LEFT/RIGHT/Straight" derived from True_Rx sign (with deadband)
 """
 
 import sys
 import numpy as np
 import pandas as pd
-import cv2  # Only used if the user opens a video; safe to import either way.
+import cv2
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog,
-    QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSlider, QComboBox, QMessageBox
+    QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSlider, QMessageBox
 )
 
 import pyqtgraph as pg
 
 
-# Pose sources / labels
 POSES = ["Pose1", "Pose2", "True"]
 
-# Mapping from signal name -> (Pose1 column, Pose2 column, True column)
+# Raw CSV column mapping (as stored in your spreadsheet/CSV)
 AXES = {
-    "Tx": ("Pose1_Tx", "Pose2_Tx", "True_Tx"),
-    "Ty": ("Pose1_Ty", "Pose2_Ty", "True_Ty"),
-    "Tz": ("Pose1_Tz", "Pose2_Tz", "True_Tz"),
-    "Rx": ("Pose1_Rx", "Pose2_Rx", "True_Rx"),
-    "Ry": ("Pose1_Ry", "Pose2_Ry", "True_Ry"),
-    "Rz": ("Pose1_Rz", "Pose2_Rz", "True_Rz"),
+    "Tx": ("Pose1_Tx", "Pose2_Tx", "True_Tx"),  # normal component (unitless)
+    "Ty": ("Pose1_Ty", "Pose2_Ty", "True_Ty"),  # normal component (unitless)
+    "Tz": ("Pose1_Tz", "Pose2_Tz", "True_Tz"),  # normal component (unitless)
+    "Rx": ("Pose1_Rx", "Pose2_Rx", "True_Rx"),  # translation distance (mm) — lateral
+    "Ry": ("Pose1_Ry", "Pose2_Ry", "True_Ry"),  # translation distance (mm)
+    "Rz": ("Pose1_Rz", "Pose2_Rz", "True_Rz"),  # translation distance (mm) — depth/range
 }
 
-# Always-visible “main” graphs (core 3-DoF)
-MAIN_SIGNALS = ["Tx", "Ty", "Rz"]
-
-# Dropdown options for extra plots (rebuild plot area when changed)
-EXTRA_OPTIONS = [
-    ("None", []),
-    ("Tz", ["Tz"]),
-    ("Rx", ["Rx"]),
-    ("Ry", ["Ry"]),
-    ("Tz + Rx", ["Tz", "Rx"]),
-    ("Tz + Ry", ["Tz", "Ry"]),
-    ("Rx + Ry", ["Rx", "Ry"]),
-    ("Tz + Rx + Ry", ["Tz", "Rx", "Ry"]),
-]
+# We only show these 3 graphs now:
+# 1) Rz (depth, mm)
+# 2) Rx (lateral, mm)
+# 3) Yaw_abs_deg = atan2(Tx, Tz) + 180 degrees  (using normal-vector components)
+MAIN_PLOTS = ["Rz", "Rx", "Yaw_abs_deg"]
 
 
 def safe_float(x):
-    """Convert to float; return NaN if conversion fails."""
     try:
         return float(x)
     except Exception:
         return np.nan
 
 
-class CsvPosePlayer(QMainWindow):
+def yaw_abs_deg_from_normal(tx, tz):
     """
-    Main GUI window.
-    Holds:
-    - CSV data + current index i
-    - Playback timer
-    - Plot objects + cursor lines
-    - Optional video capture, shown in separate OpenCV window if loaded
+    Compute absolute yaw angle (deg) from normal components.
+    yaw = atan2(tx, tz) in radians, converted to degrees, shifted by +180 for [0, 360).
     """
+    if np.isnan(tx) or np.isnan(tz):
+        return np.nan
+    yaw = np.degrees(np.arctan2(tx, tz)) + 180.0
+    # Keep it in [0, 360)
+    yaw = yaw % 360.0
+    return yaw
 
+
+class CsvPosePlayer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LAR Pose CSV Viewer")
+        self.setWindowTitle("LAR Pose CSV Viewer (Depth / Lateral / Yaw)")
 
-        # -----------------------
-        # CSV state (mandatory)
-        # -----------------------
-        self.df = None          # pandas DataFrame containing CSV rows
-        self.i = 0              # current frame index (row index)
-        self.playing = False    # playback state
+        # CSV state
+        self.df = None
+        self.i = 0
+        self.playing = False
 
-        # Playback speed (GUI timer interval)
+        # Playback speed control
         self.base_fps = 10
         self.playback_fps = self.base_fps
 
-        # Plot windowing:
-        # - If None: show full history (0..i)
-        # - If number: show only last N seconds by using Time[s] to find start index
-        self.window_seconds = None
+        # Plot windowing: show last N seconds (time-based), x-axis is frame index
+        self.window_seconds = 8.0
 
-        # LAR direction threshold (deadband to avoid flicker near Tx ~ 0)
+        # Left/right deadband on lateral translation (mm)
         self.look_threshold_mm = 5.0
 
-        # Extra plot selection state
-        self.extra_signals = []  # e.g., ["Tz","Rx"]
-
-        # -----------------------
-        # OPTIONAL video state
-        # -----------------------
+        # OPTIONAL video state (separate OpenCV window)
         self.video_path = None
-        self.cap = None                  # cv2.VideoCapture or None
+        self.cap = None
         self.video_frame_count = 0
-        self.video_fps = 0.0
         self.video_window_name = "LAR Raw Footage (Synced)"
         self.video_enabled = False
         self.last_video_frame_shown = -1
 
-        # -----------------------
         # Timer drives playback
-        # -----------------------
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
 
-        # -----------------------
-        # Build UI
-        # -----------------------
+        # ---------- UI ----------
         root = QWidget()
         self.setCentralWidget(root)
         main = QVBoxLayout(root)
 
-        # --- Top controls ---
+        # Top controls
         top = QHBoxLayout()
 
         self.btn_open_csv = QPushButton("Open CSV")
@@ -144,21 +123,9 @@ class CsvPosePlayer(QMainWindow):
         self.btn_reset = QPushButton("Reset")
         self.btn_reset.clicked.connect(self.reset)
 
-        self.speed = QComboBox()
-        self.speed.addItems(["0.5x", "1x", "2x", "4x"])
-        self.speed.setCurrentText("1x")
-        self.speed.currentTextChanged.connect(self.set_speed)
-
-        self.extras = QComboBox()
-        self.extras.addItems([name for name, _ in EXTRA_OPTIONS])
-        self.extras.setCurrentText("None")
-        self.extras.currentTextChanged.connect(self.set_extras)
-
-        # File/status info label
         self.lbl_info = QLabel("No CSV loaded.")
         self.lbl_info.setMinimumWidth(560)
 
-        # Color key for curves
         self.lbl_key = QLabel("Blue=Pose1 | Orange=Pose2 | Green(thick)=True/Chosen")
         self.lbl_key.setStyleSheet("font-weight: 600;")
 
@@ -166,12 +133,6 @@ class CsvPosePlayer(QMainWindow):
         top.addWidget(self.btn_open_video)
         top.addWidget(self.btn_play)
         top.addWidget(self.btn_reset)
-        top.addSpacing(10)
-        top.addWidget(QLabel("Speed:"))
-        top.addWidget(self.speed)
-        top.addSpacing(12)
-        top.addWidget(QLabel("Extras:"))
-        top.addWidget(self.extras)
         top.addSpacing(12)
         top.addWidget(self.lbl_info)
         top.addSpacing(18)
@@ -180,28 +141,28 @@ class CsvPosePlayer(QMainWindow):
 
         main.addLayout(top)
 
-        # --- Scrubber row ---
+        # Scrubber row
         scrub = QHBoxLayout()
 
         self.slider = QSlider(Qt.Horizontal)
-        self.slider.setEnabled(False)              # disabled until CSV loaded
+        self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self.slider_changed)
 
         self.lbl_frame = QLabel("Frame: - / -")
         self.lbl_time = QLabel("t = - s")
-        self.lbl_lar_dir = QLabel("LAR: -")
-        self.lbl_lar_dir.setStyleSheet("font-weight: 700;")
+        #self.lbl_lar_dir = QLabel("LAR: -")
+        #self.lbl_lar_dir.setStyleSheet("font-weight: 700;")
 
         scrub.addWidget(QLabel("Scrub:"))
         scrub.addWidget(self.slider, 1)
         scrub.addWidget(self.lbl_frame)
         scrub.addWidget(self.lbl_time)
         scrub.addSpacing(12)
-        scrub.addWidget(self.lbl_lar_dir)
+        #scrub.addWidget(self.lbl_lar_dir)
 
         main.addLayout(scrub)
 
-        # --- Pose panels ---
+        # Pose panels
         pose_row = QHBoxLayout()
         self.pose_labels = {}
 
@@ -210,7 +171,6 @@ class CsvPosePlayer(QMainWindow):
             title = QLabel(f"<b>{p}</b>")
             box.addWidget(title)
 
-            # Monospace label for readability
             lbl = QLabel("Tx: -\nTy: -\nTz: -\nRx: -\nRy: -\nRz: -")
             lbl.setStyleSheet("font-family: Consolas, monospace;")
             box.addWidget(lbl)
@@ -218,71 +178,52 @@ class CsvPosePlayer(QMainWindow):
             self.pose_labels[p] = lbl
             pose_row.addLayout(box)
 
-        # "Chosen" explanation + which candidate matches True
         self.lbl_choice = QLabel(
             "<b>Chosen:</b> -<br>"
             "<span style='font-size:11px;'>"
-            "d1 = ||[Pose1_Tx,Pose1_Ty,Pose1_Rz] - [True_Tx,True_Ty,True_Rz]||<br>"
-            "d2 = ||[Pose2_Tx,Pose2_Ty,Pose2_Rz] - [True_Tx,True_Ty,True_Rz]||"
+            "d1 = ||[Pose1_Rx, Pose1_Rz, yaw1] - [True_Rx, True_Rz, yawT]||<br>"
+            "d2 = ||[Pose2_Rx, Pose2_Rz, yaw2] - [True_Rx, True_Rz, yawT]||"
             "</span>"
         )
         pose_row.addWidget(self.lbl_choice)
-
         main.addLayout(pose_row)
 
-        # --- Plots area (pyqtgraph) ---
+        # Plots
         self.plot_widget = pg.GraphicsLayoutWidget()
         main.addWidget(self.plot_widget, 1)
 
-        # Plot objects
-        self.plots = {}     # plots[sig] = PlotItem
-        self.curves = {}    # curves[sig][pose] = PlotDataItem
-        self.cursors = {}   # cursors[sig] = InfiniteLine
+        self.plots = {}
+        self.curves = {}
+        self.cursors = {}
 
-        # Initial plot build (Tx/Ty/Rz only)
         self._setup_plots()
 
-    # ------------------------------------------------------------
-    # Plot building / rebuilding (when extras dropdown changes)
-    # ------------------------------------------------------------
+    # ---------- Plot setup ----------
     def _setup_plots(self):
-        """Build plots for MAIN_SIGNALS + extra_signals."""
         self.plot_widget.clear()
         self.plots.clear()
         self.curves.clear()
         self.cursors.clear()
 
-        # Line styles for each pose source
         pose_styles = {
             "Pose1": pg.mkPen(color=(80, 170, 255), width=2),   # blue
             "Pose2": pg.mkPen(color=(255, 170, 80), width=2),   # orange
             "True":  pg.mkPen(color=(120, 255, 120), width=3),  # green thick
         }
 
-        # Y-axis labels
-        # Note: In your pipeline, Rx/Ry/Rz appear to be normal-vector components (unitless),
-        # not Euler angles; label accordingly.
         y_labels = {
-            "Tx": "Tx (mm)",
-            "Ty": "Ty (mm)",
-            "Tz": "Tz (mm)",
-            "Rx": "Rx (unitless / normal comp)",
-            "Ry": "Ry (unitless / normal comp)",
-            "Rz": "Rz (unitless / normal comp)",
+            "Rz": "Depth Translation (mm)",
+            "Rx": "Lateral Translation (mm)",
+            "Yaw_abs_deg": "Absolute Yaw (deg) = atan2(Tx, Tz)+180",
         }
 
-        # Signals displayed = main + extras
-        signals = MAIN_SIGNALS + list(self.extra_signals)
-
-        # Build one plot per signal vertically stacked
-        for r, sig in enumerate(signals):
+        for r, sig in enumerate(MAIN_PLOTS):
             p = self.plot_widget.addPlot(row=r, col=0)
             p.showGrid(x=True, y=True)
             p.setLabel("left", y_labels.get(sig, sig))
-            p.setLabel("bottom", "Frame")  # x-axis is frame index
+            p.setLabel("bottom", "Frame")
             self.plots[sig] = p
 
-            # Create 3 curves: Pose1, Pose2, True
             self.curves[sig] = {}
             for pose_name in POSES:
                 legend_name = {
@@ -293,36 +234,26 @@ class CsvPosePlayer(QMainWindow):
                 curve = p.plot([], [], pen=pose_styles[pose_name], name=legend_name)
                 self.curves[sig][pose_name] = curve
 
-            # Vertical cursor line marking current frame index
             cursor_pen = pg.mkPen(color=(180, 180, 180), width=2, style=Qt.DashLine)
             vline = pg.InfiniteLine(pos=0, angle=90, movable=False, pen=cursor_pen)
             p.addItem(vline)
             self.cursors[sig] = vline
 
-        # Only add legend to the top plot (saves space)
-        if signals:
-            self.plots[signals[0]].addLegend()
+        # Legend on the first plot only
+        self.plots[MAIN_PLOTS[0]].addLegend()
 
-        # If we already have CSV loaded, refresh to current frame
         if self.df is not None:
             self._update_frame_ui()
 
     def _clear_plots(self):
-        """Reset curves and cursor positions."""
-        signals = MAIN_SIGNALS + list(self.extra_signals)
-        for sig in signals:
+        for sig in MAIN_PLOTS:
             for pose_name in POSES:
-                if sig in self.curves and pose_name in self.curves[sig]:
-                    self.curves[sig][pose_name].setData([], [])
-            if sig in self.cursors:
-                self.cursors[sig].setPos(0)
+                self.curves[sig][pose_name].setData([], [])
+            self.cursors[sig].setPos(0)
 
-    # ------------------------------------------------------------
-    # CSV loading (mandatory input)
-    # ------------------------------------------------------------
+    # ---------- CSV loading ----------
     def open_csv(self):
-        """Open CSV and prepare slider + labels."""
-        path, _ = QFileDialog.getOpenFileName(self, "Open Jan12GNCTest.csv", "", "CSV Files (*.csv)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv)")
         if not path:
             return
 
@@ -332,7 +263,6 @@ class CsvPosePlayer(QMainWindow):
             QMessageBox.critical(self, "CSV Error", f"Failed to read CSV:\n{e}")
             return
 
-        # Validate required columns
         required = ["Time [s]"]
         for sig in AXES:
             required.extend(list(AXES[sig]))
@@ -342,20 +272,17 @@ class CsvPosePlayer(QMainWindow):
             QMessageBox.critical(self, "CSV Error", f"CSV missing columns:\n{missing}")
             return
 
-        # Convert required columns to numeric
         for c in required:
             df[c] = df[c].map(safe_float)
 
         self.df = df
         self.i = 0
 
-        # Enable scrubber
         self.slider.setEnabled(True)
         self.slider.setMinimum(0)
         self.slider.setMaximum(len(df) - 1)
         self.slider.setValue(0)
 
-        # Update info label with frames + duration + estimated fps
         N = len(df)
         t0 = df["Time [s]"].iloc[0]
         t1 = df["Time [s]"].iloc[-1]
@@ -363,24 +290,15 @@ class CsvPosePlayer(QMainWindow):
         fps_est = (N - 1) / duration if (np.isfinite(duration) and duration > 0) else float("nan")
 
         self.lbl_info.setText(
-            f"CSV: {path} | Frames: {N} | Duration: {duration:.2f}s | CSV FPS≈{fps_est:.2f} | Playback FPS={self.playback_fps}"
+            f"CSV: {path} | Frames: {N} | Duration: {duration:.2f}s | CSV FPS≈{fps_est:.2f}"
         )
 
-        # Reset plots + draw first frame state
         self._clear_plots()
         self._update_frame_ui()
-
-        # If video was loaded previously, refresh it to frame 0 (optional)
         self._update_video_window(force=True)
 
-    # ------------------------------------------------------------
-    # OPTIONAL video controls (separate OpenCV window)
-    # ------------------------------------------------------------
+    # ---------- Optional video ----------
     def open_video(self):
-        """
-        Open optional MP4 and display in a separate OpenCV window.
-        This does NOT affect CSV plotting if video is not opened.
-        """
         path, _ = QFileDialog.getOpenFileName(self, "Open Video", "", "Video Files (*.mp4 *.avi *.mov *.mkv)")
         if not path:
             return
@@ -390,42 +308,27 @@ class CsvPosePlayer(QMainWindow):
             QMessageBox.critical(self, "Video Error", "Failed to open video.")
             return
 
-        # Close any previous video capture/window
         self._close_video()
 
         self.video_path = path
         self.cap = cap
         self.video_enabled = True
         self.video_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        self.video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
         self.last_video_frame_shown = -1
 
-        # Create separate window (independent of Qt layout)
         cv2.namedWindow(self.video_window_name, cv2.WINDOW_NORMAL)
-
-        # Show current CSV frame if loaded; otherwise show frame 0
         self._update_video_window(force=True)
 
     def _update_video_window(self, force: bool = False):
-        """
-        If video is enabled, show the frame corresponding to self.i in a separate OpenCV window.
-        Sync method = frame index (row i ≈ video frame i).
-        """
         if not self.video_enabled or self.cap is None:
             return
-
         if not force and self.i == self.last_video_frame_shown:
             return
 
         frame_idx = int(self.i)
-
-        # Clamp to available range if we know it
         if self.video_frame_count > 0:
             frame_idx = max(0, min(frame_idx, self.video_frame_count - 1))
-        else:
-            frame_idx = max(0, frame_idx)
 
-        # Seek and read
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ok, frame = self.cap.read()
         if not ok or frame is None:
@@ -433,10 +336,9 @@ class CsvPosePlayer(QMainWindow):
 
         self.last_video_frame_shown = frame_idx
         cv2.imshow(self.video_window_name, frame)
-        cv2.waitKey(1)  # keeps the OpenCV window responsive
+        cv2.waitKey(1)
 
     def _close_video(self):
-        """Release video resources and close the OpenCV window."""
         if self.cap is not None:
             try:
                 self.cap.release()
@@ -450,11 +352,8 @@ class CsvPosePlayer(QMainWindow):
         except Exception:
             pass
 
-    # ------------------------------------------------------------
-    # Playback + UI controls
-    # ------------------------------------------------------------
+    # ---------- Controls ----------
     def toggle_play(self):
-        """Toggle play/pause (CSV playback)."""
         if self.df is None:
             return
 
@@ -467,40 +366,7 @@ class CsvPosePlayer(QMainWindow):
         else:
             self.timer.stop()
 
-    def set_speed(self, text):
-        """Adjust playback speed (timer frequency)."""
-        mult = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0, "4x": 4.0}[text]
-        self.playback_fps = max(1, int(self.base_fps * mult))
-
-        # If playing, restart timer with new interval
-        if self.playing:
-            self.timer.stop()
-            interval_ms = int(1000 / self.playback_fps)
-            self.timer.start(max(interval_ms, 1))
-
-        # Update the info label's playback fps if CSV is loaded
-        if self.df is not None:
-            # Keep it simple: just rewrite the last part by recomputing stats quickly
-            df = self.df
-            N = len(df)
-            t0 = df["Time [s]"].iloc[0]
-            t1 = df["Time [s]"].iloc[-1]
-            duration = float(t1 - t0) if np.isfinite(t1 - t0) else float("nan")
-            fps_est = (N - 1) / duration if (np.isfinite(duration) and duration > 0) else float("nan")
-            self.lbl_info.setText(
-                f"CSV loaded | Frames: {N} | Duration: {duration:.2f}s | CSV FPS≈{fps_est:.2f} | Playback FPS={self.playback_fps}"
-            )
-
-    def set_extras(self, text):
-        """Change extra plot signals and rebuild plot layout."""
-        for name, sigs in EXTRA_OPTIONS:
-            if name == text:
-                self.extra_signals = sigs
-                break
-        self._setup_plots()
-
     def reset(self):
-        """Reset to frame 0 and clear plots."""
         if self.df is None:
             return
 
@@ -515,29 +381,22 @@ class CsvPosePlayer(QMainWindow):
         self._update_video_window(force=True)
 
     def slider_changed(self, v):
-        """When user scrubs, jump to that frame and update UI/plots/video."""
         if self.df is None:
             return
-
         self.i = int(v)
         self._update_frame_ui()
         self._update_video_window(force=True)
 
-    # ------------------------------------------------------------
-    # Timer tick: advance one frame
-    # ------------------------------------------------------------
     def _tick(self):
-        """Advance by one frame during playback."""
         if self.df is None:
             return
 
         self.i += 1
         if self.i >= len(self.df):
             self.i = len(self.df) - 1
-            self.toggle_play()  # auto-stop at end
+            self.toggle_play()
             return
 
-        # Update slider without retriggering slider_changed
         self.slider.blockSignals(True)
         self.slider.setValue(self.i)
         self.slider.blockSignals(False)
@@ -545,55 +404,66 @@ class CsvPosePlayer(QMainWindow):
         self._update_frame_ui()
         self._update_video_window()
 
-    # ------------------------------------------------------------
-    # Plot update helper
-    # ------------------------------------------------------------
+    # ---------- Plot update ----------
     def _update_plots_incremental(self):
-        """
-        Update plot curves up to the current frame index.
-        Uses time-based windowing (window_seconds) but x-axis is frame number.
-        """
         if self.df is None:
             return
 
         t_all = self.df["Time [s]"].to_numpy()
         t_now = t_all[self.i]
 
-        # Determine the start index for the plotted window
         if self.window_seconds is None:
             start = 0
         else:
             t_min = t_now - self.window_seconds
             start = int(np.searchsorted(t_all, t_min, side="left"))
 
-        # X-axis = frame indices
         x = np.arange(start, self.i + 1)
 
-        signals = MAIN_SIGNALS + list(self.extra_signals)
-        for sig in signals:
-            c1, c2, ct = AXES[sig]
+        # Helper: fetch a Pose column slice
+        def col_slice(col_name):
+            return self.df[col_name].to_numpy()[start:self.i + 1]
 
-            y1 = self.df[c1].to_numpy()[start:self.i + 1]
-            y2 = self.df[c2].to_numpy()[start:self.i + 1]
-            yt = self.df[ct].to_numpy()[start:self.i + 1]
+        # 1) Rz plot (depth mm) — uses *_Rz columns directly
+        for pose_name, (c1, c2, ct) in [("Pose1", AXES["Rz"]), ("Pose2", AXES["Rz"]), ("True", AXES["Rz"])]:
+            pass  # (we’ll set below more cleanly)
 
-            self.curves[sig]["Pose1"].setData(x, y1)
-            self.curves[sig]["Pose2"].setData(x, y2)
-            self.curves[sig]["True"].setData(x, yt)
+        rz_cols = AXES["Rz"]
+        rx_cols = AXES["Rx"]
 
-            # Move the vertical cursor to the current frame
+        # For yaw, we compute from Tx and Tz normal components
+        tx_cols = AXES["Tx"]
+        tz_cols = AXES["Tz"]
+
+        # Build arrays for each pose for each main plot
+        for pose_idx, pose_name in enumerate(POSES):
+            # Columns for this pose
+            rz_col = rz_cols[pose_idx]
+            rx_col = rx_cols[pose_idx]
+            tx_col = tx_cols[pose_idx]
+            tz_col = tz_cols[pose_idx]
+
+            # Depth & lateral
+            y_rz = col_slice(rz_col)
+            y_rx = col_slice(rx_col)
+
+            # Yaw from normal
+            tx = col_slice(tx_col)
+            tz = col_slice(tz_col)
+            y_yaw = np.array([yaw_abs_deg_from_normal(a, b) for a, b in zip(tx, tz)], dtype=float)
+
+            self.curves["Rz"][pose_name].setData(x, y_rz)
+            self.curves["Rx"][pose_name].setData(x, y_rx)
+            self.curves["Yaw_abs_deg"][pose_name].setData(x, y_yaw)
+
+        # Cursor lines + x-range scroll
+        for sig in MAIN_PLOTS:
             self.cursors[sig].setPos(self.i)
-
-        # Keep plots scrolling if windowing is enabled
-        if self.window_seconds is not None:
-            for sig in signals:
+            if self.window_seconds is not None:
                 self.plots[sig].setXRange(start, self.i, padding=0)
 
-    # ------------------------------------------------------------
-    # Update all per-frame UI elements
-    # ------------------------------------------------------------
+    # ---------- Frame UI update ----------
     def _update_frame_ui(self):
-        """Update labels, pose panels, chosen pose text, and plots for frame self.i."""
         if self.df is None:
             return
 
@@ -604,20 +474,19 @@ class CsvPosePlayer(QMainWindow):
         self.lbl_frame.setText(f"Frame: {self.i} / {n - 1}")
         self.lbl_time.setText(f"t = {t:.3f} s")
 
-        # LAR direction based on True_Tx sign convention (matching main.py),
-        # with deadband to avoid flicker around 0.
-        tx_true = float(row["True_Tx"])
-        if np.isnan(tx_true):
-            lar_dir = "LAR: Unknown"
-        elif tx_true >= self.look_threshold_mm:
-            lar_dir = "LAR: Looking RIGHT"
-        elif tx_true <= -self.look_threshold_mm:
-            lar_dir = "LAR: Looking LEFT"
-        else:
-            lar_dir = "LAR: Straight"
-        self.lbl_lar_dir.setText(lar_dir)
+        # LEFT/RIGHT based on *lateral translation* (True_Rx)
+        #rx_true = float(row["True_Rx"])
+        #if np.isnan(rx_true):
+        #    lar_dir = "LAR: Unknown"
+        #elif rx_true >= self.look_threshold_mm:
+        #    lar_dir = "LAR: Looking RIGHT"
+        #elif rx_true <= -self.look_threshold_mm:
+        #    lar_dir = "LAR: Looking LEFT"
+        #else:
+        #    lar_dir = "LAR: Straight"
+        #self.lbl_lar_dir.setText(lar_dir)
 
-        # Pose panels (show all values even if not plotted)
+        # Pose panels still show all raw columns (Tx..Rz) as stored
         for pose in POSES:
             tx = row.get(f"{pose}_Tx", np.nan)
             ty = row.get(f"{pose}_Ty", np.nan)
@@ -630,34 +499,47 @@ class CsvPosePlayer(QMainWindow):
                 f"Tx: {tx: .3f}\nTy: {ty: .3f}\nTz: {tz: .3f}\nRx: {rx: .3f}\nRy: {ry: .3f}\nRz: {rz: .3f}"
             )
 
-        # d1/d2 tells which candidate pose matches "True" more closely in the 3-DoF you care about
-        p1 = np.array([row["Pose1_Tx"], row["Pose1_Ty"], row["Pose1_Rz"]], dtype=float)
-        p2 = np.array([row["Pose2_Tx"], row["Pose2_Ty"], row["Pose2_Rz"]], dtype=float)
-        tr = np.array([row["True_Tx"], row["True_Ty"], row["True_Rz"]], dtype=float)
+        # Update d1/d2 in the new 3DoF:
+        #   lateral = Rx (mm)
+        #   depth   = Rz (mm)
+        #   yaw     = atan2(Tx, Tz)+180 (deg)
+        def pose_triplet(prefix):
+            rx = float(row[f"{prefix}_Rx"])
+            rz = float(row[f"{prefix}_Rz"])
+            tx = float(row[f"{prefix}_Tx"])
+            tz = float(row[f"{prefix}_Tz"])
+            yaw = yaw_abs_deg_from_normal(tx, tz)
+            return np.array([rx, rz, yaw], dtype=float)
 
-        d1 = np.linalg.norm(p1 - tr)
-        d2 = np.linalg.norm(p2 - tr)
-        chosen = "Pose1" if d1 <= d2 else "Pose2"
+        p1 = pose_triplet("Pose1")
+        p2 = pose_triplet("Pose2")
+        tr = pose_triplet("True")
+
+        # Handle NaNs safely: if yaw is NaN, distances become NaN — that’s OK to display
+        d1 = np.linalg.norm(p1 - tr) if np.all(np.isfinite(p1)) and np.all(np.isfinite(tr)) else np.nan
+        d2 = np.linalg.norm(p2 - tr) if np.all(np.isfinite(p2)) and np.all(np.isfinite(tr)) else np.nan
+
+        if np.isnan(d1) or np.isnan(d2):
+            chosen = "Pose1"  # fallback (True is already chosen in your CSV)
+        else:
+            chosen = "Pose1" if d1 <= d2 else "Pose2"
 
         self.lbl_choice.setText(
             f"<b>Chosen:</b> {chosen} (d1={d1:.4g}, d2={d2:.4g})<br>"
             "<span style='font-size:11px;'>"
-            "d1 = ||[Pose1_Tx,Pose1_Ty,Pose1_Rz] - [True_Tx,True_Ty,True_Rz]||<br>"
-            "d2 = ||[Pose2_Tx,Pose2_Ty,Pose2_Rz] - [True_Tx,True_Ty,True_Rz]||"
+            "d1 = ||[Pose1_Rx, Pose1_Rz, yaw1] - [True_Rx, True_Rz, yawT]||<br>"
+            "d2 = ||[Pose2_Rx, Pose2_Rz, yaw2] - [True_Rx, True_Rz, yawT]||"
             "</span>"
         )
 
-        # Update plots incrementally
         self._update_plots_incremental()
 
     def closeEvent(self, event):
-        """Cleanup on GUI close."""
         self._close_video()
         super().closeEvent(event)
 
 
 def main():
-    """Entry point."""
     app = QApplication(sys.argv)
     w = CsvPosePlayer()
     w.resize(1220, 920)
